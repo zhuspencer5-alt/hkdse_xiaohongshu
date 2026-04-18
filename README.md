@@ -38,8 +38,8 @@
 ### Step 1 · clone + 一键装
 
 ```bash
-git clone https://github.com/Lancelot2004314/xhs-hkdse.git
-cd xhs-hkdse
+git clone https://github.com/zhuspencer5-alt/hkdse_xiaohongshu.git
+cd hkdse_xiaohongshu
 bash install.sh    # 自动装 Python venv + 下载 xhs-mcp 二进制 + 准备配置
 ```
 
