@@ -39,6 +39,8 @@ def _build_scout_task(ctx: RunContext) -> AgentTask:
 
 def _build_strategist_task(ctx: RunContext) -> AgentTask:
     pack = ctx.state.get("research_pack") or {}
+    if not isinstance(pack, dict):
+        pack = {"raw": pack}
     picks = pack.get("picks") or []
     topic = ctx.inputs.get("topic") or ctx.inputs.get("keyword") or ""
     subject = ctx.inputs.get("subject") or ""
@@ -59,6 +61,8 @@ def _build_strategist_task(ctx: RunContext) -> AgentTask:
 
 def _build_writer_task(ctx: RunContext) -> AgentTask:
     brief = ctx.state.get("brief") or {}
+    if not isinstance(brief, dict):
+        brief = {"raw": brief}
     topic = ctx.inputs.get("topic") or ctx.inputs.get("keyword") or ""
     subject = ctx.inputs.get("subject") or ""
     angle = ctx.inputs.get("angle") or "soft_dry_goods"
@@ -74,15 +78,42 @@ def _build_writer_task(ctx: RunContext) -> AgentTask:
 
 def _build_critic_task(ctx: RunContext) -> AgentTask:
     draft = ctx.state.get("draft") or {}
+    if not isinstance(draft, dict):
+        draft = {"raw": draft}
+    title = str(draft.get("title") or "")
+    content = str(draft.get("content") or "")
+    title_len = len(title)
+    content_len = len(content)
+    length_note = (
+        f"\n\n【系统精确字数 (不要自己数)】"
+        f"\n- title 当前 {title_len} 字 (硬上限 20; 超过 20 必须记 issue 必改)"
+        f"\n- content 当前 {content_len} 字 (硬上限 1000; 超过 1000 必须记 issue 必改; 900-1000 之间记 warning)"
+    )
     return AgentTask(
-        user_prompt="请审下面这份草稿. 严格按 A/B/C 红线 + D/E 必查项审, 输出 verdict.",
-        inputs={"draft": draft, "iteration": ctx.state.get("_critic_iteration", 1)},
+        user_prompt=(
+            "请审下面这份草稿. 严格按 A/B/C 红线 + D/E 必查项审, 输出 verdict."
+            + length_note
+        ),
+        inputs={
+            "draft": draft,
+            "iteration": ctx.state.get("_critic_iteration", 1),
+            "_measured_lengths": {
+                "title_chars": title_len,
+                "content_chars": content_len,
+                "title_max": 20,
+                "content_max": 1000,
+            },
+        },
     )
 
 
 def _build_reviser_task(ctx: RunContext) -> AgentTask:
     draft = ctx.state.get("draft") or {}
+    if not isinstance(draft, dict):
+        draft = {"raw": draft}
     critic = ctx.state.get("critic_report") or {}
+    if not isinstance(critic, dict):
+        critic = {"raw": critic}
     return AgentTask(
         user_prompt="请按 critic_report 里的 issues 逐条修订下面这份原稿, 不要漏改, 不要改无问题的部分.",
         inputs={"original_draft": draft, "critic_report": critic},
@@ -91,6 +122,8 @@ def _build_reviser_task(ctx: RunContext) -> AgentTask:
 
 def _build_cover_designer_task(ctx: RunContext) -> AgentTask:
     draft = ctx.state.get("draft") or {}
+    if not isinstance(draft, dict):
+        draft = {}
     # 用 run_id 作为 draft_id 命名空间 (app.py 入队时会把图片信息合并到正式 draft)
     draft_id = ctx.run_id
     title = (draft.get("title") or "").strip()

@@ -47,7 +47,7 @@ TREND_SCOUT = AgentSpec(
     tools=["xhs.search_feeds", "xhs.get_feed_detail"],
     model=None,
     temperature=0.3,
-    max_tokens=4000,
+    max_tokens=8000,
     max_iterations=6,
     output_schema={
         "type": "object",
@@ -148,8 +148,8 @@ WRITER = AgentSpec(
 - 简体中文为主, 考试名称/卷别可繁体或英文
 
 写作要求:
-- title: 12-22 字, emoji + 数字/反差
-- content: 600-1200 字; 段落短小 (2-3 行一段); 用 emoji/分隔符做视觉锚点
+- title: 12-20 字 (硬上限 20, 含 emoji 与符号; 超过会被小红书拒绝发布), emoji + 数字/反差
+- content: 600-900 字 (硬上限 1000, 含正文标点; 超过会被小红书拒绝发布; 后续会自动追加 tag 行, 务必留余量); 段落短小 (2-3 行一段); 用 emoji/分隔符做视觉锚点
 - 涉及具体分数、考试占比、政策、大学要求时, 句末加 [source: ] (留空让审稿人补)
 - tags: 5-10 个, 必含 #DSE 或 #HKDSE
 - fact_lines: content 按 \\n 切行后, 含硬事实的 0-based 行号列表
@@ -169,8 +169,16 @@ WRITER = AgentSpec(
         "type": "object",
         "required": ["title", "content", "tags"],
         "properties": {
-            "title": {"type": "string"},
-            "content": {"type": "string"},
+            "title": {
+                "type": "string",
+                "maxLength": 20,
+                "description": "标题; 硬上限 20 字 (小红书强制)",
+            },
+            "content": {
+                "type": "string",
+                "maxLength": 1000,
+                "description": "正文; 硬上限 1000 字 (小红书强制), 建议 600-900 字留 tag 余量",
+            },
             "tags": {"type": "array", "items": {"type": "string"}},
             "cover_concept": {"type": "string"},
             "fact_lines": {"type": "array", "items": {"type": "integer"}},
@@ -201,14 +209,14 @@ B. 同行点名: 是否点名其他补习社/老师 → fail
 C. 敏感话题: 政治、宗教、LGBTQ 立场、医疗保健、灰产 → fail
 D. 事实溯源: 含具体数字/考试制度/大学要求的句子, 是否有 [source: ] 标注 → 缺失记 issue
 E. 人设一致: 是否前后矛盾 (一会儿"我以前 Lv2", 一会儿"我教 200 学生") → 矛盾记 issue
-F. 标题: 长度 12-22, 含数字或反差或 emoji → 不达标记 warning
+F. 标题: 长度 12-20 (硬上限 20, 超过 20 直接记 issue 必须改; 12-20 范围内含数字/反差/emoji 即合格, 否则 warning)
 G. tags: 5-10 个, 含 #DSE 或 #HKDSE → 不达标记 warning
-H. 字数: 600-1200 → 不达标记 warning
+H. 字数: 600-900 (硬上限 1000, 超过 1000 直接记 issue 必须改; 900-1000 之间记 warning, 因为后续会拼 tag 行)
 
 【输出】
-- passed: 仅当 A/B/C 全部通过, 且 D/E 的 issues == 0 才算 true
+- passed: 仅当 A/B/C 全部通过, 且 D/E/F-超长/H-超长 的 issues == 0 才算 true
 - 否则 passed=false, 在 issues 里逐条列出 (含 line_no 0-based + 修改建议)
-- warnings: D 之外的 F/G/H 不达标也列出, 但不影响 passed
+- warnings: D 之外的 F/G/H 不达标 (但未超硬上限) 也列出, 不影响 passed
 
 可调 web.search 给具体 [source: ] 找权威 URL (可选, 不是必须).
 """,
@@ -275,6 +283,10 @@ REVISER = AgentSpec(
 2. 不删改无问题的部分 (保持原稿风格)
 3. 修完后输出新 draft, 同时 list 出 changes_made
 
+【硬上限 — 任何情况下都不能突破】
+- title: ≤ 20 字 (小红书强制); 超长必须裁短
+- content: ≤ 1000 字, 推荐 600-900 字留 tag 余量; 超长必须删减
+
 【输出】严格 JSON, 不调工具.
 """,
     tools=[],
@@ -284,8 +296,16 @@ REVISER = AgentSpec(
         "type": "object",
         "required": ["title", "content", "tags", "changes_made"],
         "properties": {
-            "title": {"type": "string"},
-            "content": {"type": "string"},
+            "title": {
+                "type": "string",
+                "maxLength": 20,
+                "description": "标题; 硬上限 20 字 (小红书强制)",
+            },
+            "content": {
+                "type": "string",
+                "maxLength": 1000,
+                "description": "正文; 硬上限 1000 字 (小红书强制), 建议 ≤ 900 留 tag 余量",
+            },
             "tags": {"type": "array", "items": {"type": "string"}},
             "cover_concept": {"type": "string"},
             "fact_lines": {"type": "array", "items": {"type": "integer"}},

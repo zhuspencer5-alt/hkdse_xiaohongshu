@@ -48,7 +48,7 @@ agents:
     '
   model: null
   temperature: 0.3
-  max_tokens: 4000
+  max_tokens: 8000
   tools:
   - xhs.search_feeds
   - xhs.get_feed_detail
@@ -207,9 +207,9 @@ agents:
 
     写作要求:
 
-    - title: 12-22 字, emoji + 数字/反差
+    - title: 12-20 字 (硬上限 20 字, 含 emoji 与符号; 超过会被小红书拒绝发布), emoji + 数字/反差
 
-    - content: 600-1200 字; 段落短小 (2-3 行一段); 用 emoji/分隔符做视觉锚点
+    - content: 600-900 字 (硬上限 1000 字, 含正文标点符号; 超过会被小红书拒绝发布; 后续会自动追加 tag 行, 务必留余量); 段落短小 (2-3 行一段); 用 emoji/分隔符做视觉锚点
 
     - 涉及具体分数、考试占比、政策、大学要求时, 句末加 [source: ] (留空让审稿人补)
 
@@ -245,8 +245,12 @@ agents:
     properties:
       title:
         type: string
+        maxLength: 20
+        description: 标题; 硬上限 20 字 (小红书强制)
       content:
         type: string
+        maxLength: 1000
+        description: 正文; 硬上限 1000 字 (小红书强制), 建议 600-900 字留 tag 余量
       tags:
         type: array
         items:
@@ -286,16 +290,16 @@ agents:
 
     E. 人设一致: 是否前后矛盾 (一会儿"我以前 Lv2", 一会儿"我教 200 学生") → 矛盾记 issue
 
-    F. 标题: 长度 12-22, 含数字或反差或 emoji → 不达标记 warning
+    F. 标题: 长度 12-20 (硬上限 20, 超过 20 直接记 issue 必须改; 12-20 范围内含数字/反差/emoji 即合格, 否则 warning)
 
     G. tags: 5-10 个, 含 #DSE 或 #HKDSE → 不达标记 warning
 
-    H. 字数: 600-1200 → 不达标记 warning
+    H. 字数: 600-900 (硬上限 1000, 超过 1000 直接记 issue 必须改; 900-1000 之间记 warning, 因为后续会拼 tag 行)
 
 
     【输出】
 
-    - passed: 仅当 A/B/C 全部通过, 且 D/E 的 issues == 0 才算 true
+    - passed: 仅当 A/B/C 全部通过, 且 D/E/F-超长/H-超长 的 issues == 0 才算 true
 
     - 否则 passed=false, 在 issues 里逐条列出 (含 line_no 0-based + 修改建议)
 
@@ -376,6 +380,13 @@ agents:
     3. 修完后输出新 draft, 同时 list 出 changes_made
 
 
+    【硬上限 — 任何情况下都不能突破】
+
+    - title: ≤ 20 字 (小红书强制); 超长必须裁短
+
+    - content: ≤ 1000 字, 推荐 600-900 字留 tag 余量; 超长必须删减
+
+
     【输出】严格 JSON, 不调工具.
 
     '
@@ -393,8 +404,12 @@ agents:
     properties:
       title:
         type: string
+        maxLength: 20
+        description: 标题; 硬上限 20 字 (小红书强制)
       content:
         type: string
+        maxLength: 1000
+        description: 正文; 硬上限 1000 字 (小红书强制), 建议 ≤ 900 留 tag 余量
       tags:
         type: array
         items:

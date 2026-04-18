@@ -2,12 +2,13 @@
 小红书内容自动生成与发布 - Web应用主程序 (FastAPI版本)
 """
 import os
+import json
 import logging
 import asyncio
 import time
 import uuid
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -360,6 +361,115 @@ async def test_login(request_data: TestLoginRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# =====================================================================
+# 发布相关帮助函数
+# =====================================================================
+
+# 小红书正文 / 标题 上限 (xhs-mcp 校验同此值; 超过会发不出去)
+XHS_MAX_TITLE_CHARS = 20      # 实际硬限制 20, 超过 xhs-mcp 直接拒绝
+XHS_MAX_CONTENT_CHARS = 1000  # xhs-mcp 错误信息: "当前输入长度为 N, 最大长度为 1000"
+
+_PUBLISH_FAIL_KEYWORDS = (
+    "失败", "错误", "异常", "拒绝",
+    "超过最大长度", "最大长度为",
+    "未登录", "请先登录",
+    "fail", "error", "exception", "rejected", "denied", "exceed",
+)
+
+
+def _validate_publish_payload(title: str, body: str) -> None:
+    """发布前预校验; 不通过抛 HTTPException 400, 避免再让 xhs-mcp 浪费一次浏览器自动化."""
+    title = (title or "").strip()
+    body = (body or "")
+    if not title:
+        raise HTTPException(status_code=400, detail="title 不能为空")
+    if not body.strip():
+        raise HTTPException(status_code=400, detail="content 不能为空")
+    if len(title) > XHS_MAX_TITLE_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"标题超长: 当前 {len(title)} 字, 小红书最大 {XHS_MAX_TITLE_CHARS} 字. "
+                "请在草稿编辑里把标题改短再发布."
+            ),
+        )
+    if len(body) > XHS_MAX_CONTENT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"正文超长: 当前 {len(body)} 字 (含 tag), 小红书最大 {XHS_MAX_CONTENT_CHARS} 字. "
+                "请删减正文或减少 tag 后再发布."
+            ),
+        )
+
+
+def _judge_publish_result(tool_result: Any) -> Tuple[bool, str]:
+    """统一判定 xhs-mcp publish_content 的返回结果是否成功.
+
+    判定优先级 (高 → 低):
+    1. CallToolResult.isError == True → 失败
+    2. 文本里能解析出 JSON 且含 success/ok/status 字段 → 信结构化值
+    3. 命中显式失败关键字 (失败 / error / 超过最大长度 等) → 失败
+    4. 命中成功关键字 (success/published/成功) 且没命中失败关键字 → 成功
+    5. 都没命中 → 失败 (保守: 宁可让用户再点一次, 也不假报成功)
+
+    Returns: (ok, normalized_text_for_log)
+    """
+    is_error_flag = bool(getattr(tool_result, "isError", False))
+    text = (_mcp_text(tool_result) or str(tool_result) or "").strip()
+
+    if is_error_flag:
+        return False, text or "tool_result.isError=True 但无文本"
+
+    if not text:
+        return False, "publish_content 返回空"
+
+    text_lc = text.lower()
+
+    # 2) 尝试解析 JSON
+    parsed = None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        # 也可能是 "ok\n{...}" 这种, 找第一个 { ... }
+        first = text.find("{")
+        last = text.rfind("}")
+        if 0 <= first < last:
+            try:
+                parsed = json.loads(text[first:last + 1])
+            except Exception:
+                parsed = None
+
+    if isinstance(parsed, dict):
+        for k in ("success", "ok"):
+            if k in parsed:
+                v = parsed[k]
+                if isinstance(v, bool):
+                    return (v, text)
+                if isinstance(v, str):
+                    return (v.lower() in ("true", "ok", "success"), text)
+        status = parsed.get("status")
+        if isinstance(status, str):
+            sl = status.lower()
+            if sl in ("ok", "success", "published", "completed"):
+                return True, text
+            if sl in ("failed", "error", "exception"):
+                return False, text
+        if parsed.get("error") or parsed.get("err") or parsed.get("message", "").lower().startswith(("error", "fail")):
+            return False, text
+
+    # 3) 显式失败关键字优先
+    for kw in _PUBLISH_FAIL_KEYWORDS:
+        if kw in text_lc or kw in text:
+            return False, text
+
+    # 4) 成功关键字
+    if ("success" in text_lc) or ("published" in text_lc) or ("成功" in text):
+        return True, text
+
+    return False, text
+
+
 @app.post("/api/generate-and-publish")
 async def generate_and_publish(request_data: GeneratePublishRequest) -> Dict[str, Any]:
     """生成内容并发布到小红书"""
@@ -515,19 +625,24 @@ async def publish_now(request_data: PublishNowRequest) -> Dict[str, Any]:
             if tag_line:
                 body = f"{body}\n\n{tag_line}"
 
+        _validate_publish_payload(request_data.title, body)
+
         args = {
             'title': request_data.title,
             'content': body,
             'images': request_data.images,
         }
-        logger.info(f"📤 直接发布: title={request_data.title}, images={len(request_data.images)}")
+        logger.info(
+            f"📤 直接发布: title={request_data.title} (len={len(request_data.title)}), "
+            f"body_len={len(body)}, images={len(request_data.images)}"
+        )
         async with _fresh_xhs_session(xhs_url) as session:
             tool_result = await asyncio.wait_for(
                 session.call_tool('publish_content', args),
                 timeout=240,
             )
-        result_str = _mcp_text(tool_result) or str(tool_result)
-        ok = ('success' in result_str.lower()) or ('成功' in result_str) or ('published' in result_str.lower())
+        ok, result_str = _judge_publish_result(tool_result)
+        logger.info(f"📤 publish_content 判定: ok={ok}, result[:200]={result_str[:200]}")
 
         # 记到历史
         cache_manager.add_task({
@@ -747,8 +862,13 @@ async def api_publish_draft(draft_id: str, req: DraftPublishRequest) -> Dict[str
         if tag_line:
             body = f"{body}\n\n{tag_line}"
 
+    _validate_publish_payload(title, body)
+
     args = {"title": title, "content": body, "images": images}
-    logger.info(f"📤 发布草稿 {draft_id}: {title} ({len(images)} 张图)")
+    logger.info(
+        f"📤 发布草稿 {draft_id}: title={title} (len={len(title)}), "
+        f"body_len={len(body)}, images={len(images)}"
+    )
     try:
         async with _fresh_xhs_session(xhs_url) as session:
             tool_result = await asyncio.wait_for(
@@ -761,8 +881,8 @@ async def api_publish_draft(draft_id: str, req: DraftPublishRequest) -> Dict[str
         })
         raise HTTPException(status_code=504, detail="发布超时, 请重试")
 
-    result_str = _mcp_text(tool_result) or str(tool_result)
-    ok = ('success' in result_str.lower()) or ('成功' in result_str) or ('published' in result_str.lower())
+    ok, result_str = _judge_publish_result(tool_result)
+    logger.info(f"📤 草稿 {draft_id} publish_content 判定: ok={ok}, result[:200]={result_str[:200]}")
 
     if ok:
         cache_manager.update_task_status(draft_id, "success", {

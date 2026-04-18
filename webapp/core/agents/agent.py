@@ -226,7 +226,11 @@ class Agent:
                     except Exception as e:
                         logger.warning(f"忽略畸形 tool call: {c} ({e})")
                 if not calls:
-                    # 没有 calls 又不是 final → 当 final 兜底
+                    if self.spec.output_schema or self.spec.output_must_be_json:
+                        result.error = "LLM 声明 tool_calls 但 calls 为空, 且本 agent 期望结构化输出"
+                        _emit(EventType.AGENT_FAILED, result.error, {"raw_head": raw[:300]})
+                        result.elapsed_ms = int((time.time() - t0) * 1000)
+                        return result
                     result.output = raw
                     result.ok = True
                     _emit(EventType.AGENT_COMPLETED, f"[{self.spec.name}] 兜底完成")
@@ -254,8 +258,30 @@ class Agent:
                 })
                 continue
 
-            # 未知 action: 当文本输出处理
+            # 未知 action: 如果 parsed 是 dict 且有 output 字段, 当 final 处理
+            if isinstance(parsed, dict) and "output" in parsed:
+                logger.warning(
+                    f"agent {self.spec.id} 输出 action={action} 未知, 但有 output 字段, 当 final 处理"
+                )
+                output = parsed.get("output")
+                if isinstance(output, str) and self.spec.output_schema:
+                    output_parsed = _safe_json_loads(output)
+                    if output_parsed is not None:
+                        output = output_parsed
+                result.output = output
+                result.ok = True
+                _emit(EventType.AGENT_COMPLETED, f"[{self.spec.name}] 完成 (恢复 final)")
+                result.elapsed_ms = int((time.time() - t0) * 1000)
+                return result
+
             logger.warning(f"agent {self.spec.id} 输出无效 action={action}, 当 raw 处理")
+            if self.spec.output_schema or self.spec.output_must_be_json:
+                result.error = (
+                    f"LLM 输出无法解析为预期结构 (action={action}); 原文前 300 字: {raw[:300]}"
+                )
+                _emit(EventType.AGENT_FAILED, result.error, {"raw_head": raw[:300]})
+                result.elapsed_ms = int((time.time() - t0) * 1000)
+                return result
             result.output = parsed if parsed else raw
             result.ok = True
             _emit(EventType.AGENT_COMPLETED, f"[{self.spec.name}] 兜底完成")
@@ -295,6 +321,120 @@ class Agent:
 # =====================================================================
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
+_FENCE_OPEN_RE = re.compile(r"^\s*```(?:json|JSON)?\s*", re.IGNORECASE)
+_FENCE_CLOSE_RE = re.compile(r"\s*```\s*$")
+
+
+def _strip_fences(s: str) -> str:
+    """剥离 ```json ... ``` 包裹 (含未闭合的)."""
+    s = _FENCE_OPEN_RE.sub("", s)
+    s = _FENCE_CLOSE_RE.sub("", s)
+    return s.strip()
+
+
+def _scan_balanced_json(s: str) -> Optional[Any]:
+    """扫第一个顶层 {...} 或 [...], 用栈感知字符串/转义.
+
+    关键: 只信第一个顶层 opener (整个 envelope), 不会退而抓内部的 picks/calls 数组,
+    避免把 {"action":"final","output":{...}} 错解成内层 list 的灾难.
+    截断时调 _repair_truncated_json 兜底.
+    """
+    n = len(s)
+    # 找第一个顶层 opener
+    first_idx = -1
+    for i, c in enumerate(s):
+        if c in "{[":
+            first_idx = i
+            break
+    if first_idx == -1:
+        return None
+    opener = s[first_idx]
+    closer = "}" if opener == "{" else "]"
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(first_idx, n):
+        ch = s[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                candidate = s[first_idx:i + 1]
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    return _repair_truncated_json(candidate)
+    # 没闭合 → 大概率被 max_tokens 截断, 试着补齐
+    return _repair_truncated_json(s[first_idx:])
+
+
+def _repair_truncated_json(s: str) -> Optional[Any]:
+    """对疑似被截断的 JSON 片段做修补: 截掉残缺尾部 + 补齐缺失的闭合符.
+
+    策略 (从外向内):
+    1. 沿字符扫一遍, 维护 {/[ 闭合栈
+    2. 找到最后一个"安全切点": 不在字符串内、且不卡在 key/value 半截上
+       - 安全切点 = 最近一个 ',' 或者最近一个 '}'/']' 之后
+    3. 把切点之后的残尾扔掉, 按栈余量补 `}` `]`
+    4. 反复尝试多个候选切点直到 json.loads 成功
+    """
+    if not s or s[0] not in "{[":
+        return None
+    # 第一遍: 记录每一个安全切点 (栈深度, 切点 index, 切点处的栈快照)
+    stack: List[str] = []
+    in_str = False
+    escape = False
+    safe_points: List[tuple] = []  # (index_after_char, stack_snapshot)
+    for i, ch in enumerate(s):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+                # 字符串结束也是潜在切点 (作为 value 完结)
+                safe_points.append((i + 1, list(stack)))
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch in "}]":
+            if stack and stack[-1] == ch:
+                stack.pop()
+            safe_points.append((i + 1, list(stack)))
+        elif ch == ",":
+            safe_points.append((i, list(stack)))  # 把逗号本身也丢掉
+        elif ch in "0123456789" or ch in "tfn":  # 数字/true/false/null 末尾近似
+            safe_points.append((i + 1, list(stack)))
+    # 从后往前试候选切点
+    seen: set = set()
+    for cut_idx, snap in reversed(safe_points):
+        if cut_idx in seen:
+            continue
+        seen.add(cut_idx)
+        head = s[:cut_idx].rstrip().rstrip(",")
+        tail = "".join(reversed(snap))
+        candidate = head + tail
+        try:
+            return json.loads(candidate)
+        except Exception:
+            continue
+    return None
 
 
 def _safe_json_loads(s: str) -> Optional[Any]:
@@ -305,12 +445,24 @@ def _safe_json_loads(s: str) -> Optional[Any]:
         return json.loads(s)
     except Exception:
         pass
+    stripped = _strip_fences(s)
+    if stripped and stripped != s:
+        try:
+            return json.loads(stripped)
+        except Exception:
+            pass
     m = _FENCE_RE.search(s)
     if m:
+        inner = m.group(1).strip()
         try:
-            return json.loads(m.group(1).strip())
+            return json.loads(inner)
         except Exception:
-            s = m.group(1).strip()
+            scanned = _scan_balanced_json(inner)
+            if scanned is not None:
+                return scanned
+    scanned = _scan_balanced_json(stripped or s)
+    if scanned is not None:
+        return scanned
     first = s.find("{")
     last = s.rfind("}")
     if first != -1 and last != -1 and last > first:
