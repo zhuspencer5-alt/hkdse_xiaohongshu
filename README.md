@@ -25,74 +25,74 @@
 
 ---
 
-## 快速上手 (新机器 5 分钟)
+## 快速上手 (推荐: 一键脚本, 3 步)
 
-### Step 0 · 准备 API Key
+> 💡 适用 macOS (Apple Silicon / Intel) 和 Linux. Windows 同事请用 WSL 或参考下方手动安装.
 
-最少需要:
-- **OpenRouter Key** ([注册](https://openrouter.ai)) — 跑 LLM 和 Seedream 出图都用它. 大约 \$10 够跑 50 篇.
+### Step 0 · 准备一个 OpenRouter Key
 
-可选 (装上更好):
-- **Tavily Key** ([注册](https://tavily.com)) — Critic 自动核查事实
-- **Jina Key** ([注册](https://jina.ai/reader)) — 网页正文阅读
+去 [openrouter.ai](https://openrouter.ai) 注册, 拿一个 `sk-or-v1-...` 开头的 key. 充 \$10 够跑 50 篇.
 
-### Step 1 · clone + 装环境
+(可选, 装了更好: [Tavily](https://tavily.com) 让 Critic 自动核查事实, [Jina](https://jina.ai/reader) 抓网页正文)
+
+### Step 1 · clone + 一键装
 
 ```bash
 git clone https://github.com/Lancelot2004314/xhs-hkdse.git
 cd xhs-hkdse
+bash install.sh    # 自动装 Python venv + 下载 xhs-mcp 二进制 + 准备配置
+```
 
-cd webapp
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+装完按提示编辑 `webapp/config/app_config.json` 把 `sk-or-v1-YOUR...` 替换成你的 key.
+
+### Step 2 · 扫码登录你自己的小红书 (一次性)
+
+```bash
+bash login.sh      # 弹 Chromium 二维码 → 用手机小红书 App 扫
+```
+
+cookies 存在 `xhs-mcp/cookies.json` (gitignored, 不会上传 GitHub).
+
+> 🔒 **每个同事在自己的电脑上跑这一步, 用自己的小红书账号**. 互不影响, 内容各发各号.
+
+### Step 3 · 启动
+
+```bash
+bash start.sh      # 后台起 xhs-mcp + webapp, 自动开浏览器
+```
+
+打开 **http://localhost:8080/studio** 就能用了.
+
+停止: `bash stop.sh` · 看日志: `tail -f webapp/app.log xhs-mcp/xhs-mcp.log`
+
+---
+
+<details>
+<summary>📋 手动安装 (不想用脚本时展开)</summary>
+
+```bash
+# 1. Python 环境
+cd webapp && python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt && cd ..
+
+# 2. xhs-mcp 二进制 (从 https://github.com/xpzouying/xiaohongshu-mcp/releases 下载对应平台)
+mkdir -p xhs-mcp && cd xhs-mcp
+curl -fL -o mcp.tar.gz https://github.com/xpzouying/xiaohongshu-mcp/releases/latest/download/xiaohongshu-mcp-darwin-arm64.tar.gz
+tar xzf mcp.tar.gz && rm mcp.tar.gz
+chmod +x xiaohongshu-mcp-* xiaohongshu-login-*
 cd ..
-```
 
-### Step 2 · 填配置
-
-```bash
+# 3. 配置
 cp webapp/config/app_config.example.json webapp/config/app_config.json
-# 然后编辑 app_config.json, 把 sk-or-v1-YOUR... 替换成真的 key
+# 编辑填 OpenRouter key
+
+# 4. 扫码 + 启动 (两个 terminal)
+cd xhs-mcp && ./xiaohongshu-login-darwin-arm64    # 一次性
+./xiaohongshu-mcp-darwin-arm64 -port :18060        # Terminal A
+cd webapp && source .venv/bin/activate && python app.py   # Terminal B
 ```
 
-### Step 3 · 拿 xhs-mcp 二进制 (因为大文件没进 git)
-
-去 [xpzouying/xiaohongshu-mcp/releases](https://github.com/xpzouying/xiaohongshu-mcp/releases) 下载对应平台的二进制, 放到 `xhs-mcp/`:
-
-- macOS Apple Silicon: `xiaohongshu-mcp-darwin-arm64` + `xiaohongshu-login-darwin-arm64`
-- macOS Intel: `darwin-amd64` 版本
-- Linux: `linux-amd64` 版本
-
-```bash
-chmod +x xhs-mcp/xiaohongshu-mcp-* xhs-mcp/xiaohongshu-login-*
-```
-
-### Step 4 · 扫码登录小红书 (一次性)
-
-```bash
-cd xhs-mcp
-./xiaohongshu-login-darwin-arm64
-# 终端弹 Chromium + 二维码, 用手机小红书 App 扫码 → 看到 "登录成功" 即可关
-```
-
-cookies 缓存在 `xhs-mcp/cookies.json` (gitignored).
-
-### Step 5 · 跑起来
-
-两个 terminal:
-
-```bash
-# Terminal A: xhs-mcp
-cd xhs-mcp
-./xiaohongshu-mcp-darwin-arm64 -port :18060
-
-# Terminal B: webapp
-cd webapp && source .venv/bin/activate
-python app.py
-```
-
-浏览器开 **http://localhost:8080/studio**
+</details>
 
 ---
 
