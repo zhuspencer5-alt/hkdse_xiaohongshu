@@ -25,13 +25,20 @@
     };
     if (opts.body !== undefined) init.body = JSON.stringify(opts.body);
     const resp = await fetch(path, init);
+    // Fetch 的 body stream 只能消费一次. 之前用 `resp.json()` catch 后再 `resp.text()`
+    // 会触发 "body stream already read" — 所以这里只读一次 text, 再尝试 JSON.parse.
+    let raw = '';
+    try { raw = await resp.text(); } catch (e) { raw = ''; }
     let data = null;
-    try { data = await resp.json(); } catch (_) { data = { detail: await resp.text() }; }
+    if (raw) {
+      try { data = JSON.parse(raw); } catch (_) { data = { detail: raw }; }
+    }
     if (!resp.ok) {
-      const msg = data && (data.detail || data.message) || `HTTP ${resp.status}`;
+      const detail = data && (data.detail || data.message);
+      const msg = detail || `HTTP ${resp.status} ${resp.statusText || ''}`.trim() || `HTTP ${resp.status}`;
       throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
     }
-    return data;
+    return data || {};
   }
 
   function fmtNum(n) {
@@ -382,35 +389,71 @@
     }).join('<br/>');
   }
 
-  // 把 draft.images (本地绝对路径) + image_urls (cache/images/xxx) 渲染成缩略图网格
+  // 把 draft.images (本地绝对路径) + image_urls (cache/images/xxx) 渲染成缩略图网格.
+  // 每张图都带一个 🔄 按钮可触发后端单图重生成.
   function renderImageThumbnails(d) {
-    const urls = [];
-    // 优先用 image_urls (workflow 自动生成时填的)
-    if (Array.isArray(d.image_urls)) {
-      d.image_urls.forEach((u) => { if (u) urls.push(u); });
-    }
-    // 再加 d.images 里能转成 web 可见 URL 的部分 (cache/images/...)
-    (d.images || []).forEach((p) => {
-      if (!p) return;
-      if (/^https?:\/\//i.test(p)) {
-        urls.push(p);
-      } else {
-        // 提取 cache/images/<rest> 段
-        const m = String(p).match(/cache\/images\/.+$/);
-        if (m) urls.push('/' + m[0]);
+    // 注: 之前是把 image_urls 和 images 拼成同一个数组渲染, 容易出现重复 (workflow
+    // 已经填了 image_urls + images 同一张图). 这里改为优先用 image_urls 的索引位置,
+    // image_urls 缺失再回落到 images. 这样 index 才能精准对应到后端 (0=封面, 1..=配图_n).
+    const fromUrls = Array.isArray(d.image_urls) ? d.image_urls.slice() : [];
+    const fromPaths = Array.isArray(d.images) ? d.images.slice() : [];
+    const N = Math.max(fromUrls.length, fromPaths.length);
+    const items = [];
+    for (let i = 0; i < N; i++) {
+      let u = fromUrls[i] || '';
+      if (!u) {
+        const p = fromPaths[i] || '';
+        if (/^https?:\/\//i.test(p)) {
+          u = p;
+        } else {
+          const m = String(p).match(/cache\/images\/.+$/);
+          if (m) u = '/' + m[0];
+        }
       }
-    });
-    if (!urls.length) return '';
-    const items = urls.map((u, i) => {
-      const role = i === 0 ? '封面' : `配图 ${i}`;
-      return `<div class="thumb-card">
+      if (!u) continue;
+      const role = i === 0 ? '封面 (3:4)' : `配图 ${i} (1:1)`;
+      items.push(`<div class="thumb-card" data-img-idx="${i}">
         <a href="${escapeHtml(u)}" target="_blank">
-          <img src="${escapeHtml(u)}" alt="${role}" />
+          <img src="${escapeHtml(u)}" alt="${escapeHtml(role)}" />
         </a>
-        <div class="thumb-label">${role}</div>
-      </div>`;
-    }).join('');
-    return `<div class="thumb-grid" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:8px; margin:8px 0 14px 0;">${items}</div>`;
+        <div class="thumb-label">${escapeHtml(role)}</div>
+        <div class="thumb-actions" style="display:flex; gap:4px; margin-top:4px;">
+          <button class="thumb-regen-btn" data-img-idx="${i}"
+                  title="用当前 image_model 重新生成这张图 (会覆盖原图)"
+                  style="flex:1; font-size:11px; padding:3px 6px;">🔄 重生成</button>
+        </div>
+      </div>`);
+    }
+    if (!items.length) return '';
+    return `<div class="thumb-grid" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px; margin:8px 0 14px 0;">${items.join('')}</div>`;
+  }
+
+  async function _regenDraftImage(draftId, index) {
+    const def = (index === 0 ? '留空 = 用 cover_concept 作为封面 prompt' : '留空 = 用主题/标题自动构造配图 prompt');
+    const promptOverride = window.prompt(
+      `重新生成 ${index === 0 ? '封面' : '配图 ' + index} (${index === 0 ? '3:4' : '1:1'})\n\n` +
+      `自定义 prompt (${def}):`,
+      ''
+    );
+    if (promptOverride === null) return;
+    const body = { index };
+    if ((promptOverride || '').trim()) body.prompt = promptOverride.trim();
+
+    toast(`正在生成 ${index === 0 ? '封面' : '配图 ' + index}…`, 'info', 4000);
+    try {
+      const r = await api(`/api/draft/${encodeURIComponent(draftId)}/image/regenerate`, {
+        method: 'POST', body,
+      });
+      toast(`已重生成 ${r.role} (${r.model})`, 'success', 4000);
+      // 用返回的最新 draft 重渲编辑器
+      if (r.draft) {
+        const idx = drafts.findIndex((x) => x.id === draftId);
+        if (idx >= 0) drafts[idx] = r.draft;
+        renderDraftEditor(r.draft);
+      }
+    } catch (e) {
+      toast('重生成失败: ' + e.message, 'error', 6000);
+    }
   }
 
   function renderDraftEditor(d) {
@@ -514,14 +557,36 @@
       }
     });
 
+    // 单图重生成 (🔄 按钮): 事件委托到 thumb-grid
+    const _draftRoot = $('draftEditor');
+    if (_draftRoot) {
+      _draftRoot.querySelectorAll('.thumb-regen-btn').forEach((btn) => {
+        btn.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          const idx = parseInt(btn.dataset.imgIdx || '0', 10);
+          if (Number.isNaN(idx)) return;
+          _regenDraftImage(d.id, idx);
+        });
+      });
+    }
+
     $('d_regenBtn').addEventListener('click', async () => {
       if (!d.brief) return toast('该草稿缺 brief, 无法重生成 (请去研究 tab 重新走一遍)', 'error');
       const btn = $('d_regenBtn');
       withSpinner(btn, true);
       try {
         const extra = prompt('给写手的额外指示 (可空):', '') || '';
+        // 兜底: 如果 brief 没有 topic/subject (比如来自 workflow 的 strategist),
+        // 把 draft 自身的 topic/subject/content_type 一起带上, 避免后端 Brief 校验失败.
         const r = await api('/api/draft/generate', {
-          method: 'POST', body: { brief: d.brief, extra_instructions: extra },
+          method: 'POST',
+          body: {
+            brief: d.brief,
+            extra_instructions: extra,
+            topic: d.topic || (d.brief && d.brief.topic) || '',
+            subject: d.subject || (d.brief && d.brief.subject) || '',
+            angle: d.content_type || (d.brief && d.brief.angle) || '',
+          },
         });
         toast('已生成新版本草稿', 'success');
         await loadDrafts();
@@ -669,6 +734,38 @@
   // ===================================================================
   // CONFIG TAB
   // ===================================================================
+  // 已知预设模型 slug; 下拉框找不到匹配项时自动切到 "自定义"
+  const IMAGE_MODEL_PRESETS = new Set([
+    'bytedance-seed/seedream-4.5',
+    'google/gemini-3.1-flash-image-preview',
+  ]);
+
+  function _applyImageModelToUI(slug) {
+    const sel = $('cfg_image_model_preset');
+    const wrap = $('cfg_image_model_custom_wrap');
+    const custom = $('cfg_image_model_custom');
+    if (!sel || !wrap || !custom) return;
+    const s = (slug || '').trim();
+    if (s && !IMAGE_MODEL_PRESETS.has(s)) {
+      sel.value = '__custom__';
+      custom.value = s;
+      wrap.style.display = '';
+    } else {
+      sel.value = s || 'bytedance-seed/seedream-4.5';
+      custom.value = '';
+      wrap.style.display = 'none';
+    }
+  }
+
+  function _readImageModelFromUI() {
+    const sel = $('cfg_image_model_preset');
+    if (!sel) return '';
+    if (sel.value === '__custom__') {
+      return ($('cfg_image_model_custom').value || '').trim();
+    }
+    return sel.value;
+  }
+
   async function loadConfig() {
     try {
       const d = await api('/api/config');
@@ -679,27 +776,36 @@
       $('cfg_tavily').value = c.tavily_api_key || '';
       $('cfg_jina').value = c.jina_api_key || '';
       $('cfg_xhs_url').value = c.xhs_mcp_url || 'http://localhost:18060/mcp';
+      _applyImageModelToUI(c.image_model || 'bytedance-seed/seedream-4.5');
     } catch (e) {
       toast('加载配置失败: ' + e.message, 'error');
     }
   }
+
+  // 联动: 切到 "自定义…" 时显示自定义 slug 输入
+  document.addEventListener('change', (ev) => {
+    if (ev.target && ev.target.id === 'cfg_image_model_preset') {
+      const wrap = $('cfg_image_model_custom_wrap');
+      if (wrap) wrap.style.display = ev.target.value === '__custom__' ? '' : 'none';
+    }
+  });
 
   $('saveConfigBtn').addEventListener('click', async () => {
     const btn = $('saveConfigBtn');
     withSpinner(btn, true);
     try {
       // 含 * 的脱敏值后端会自动跳过
-      await api('/api/config', {
-        method: 'POST',
-        body: {
-          llm_api_key: $('cfg_llm_key').value.trim(),
-          openai_base_url: $('cfg_base_url').value.trim(),
-          default_model: $('cfg_model').value.trim(),
-          tavily_api_key: $('cfg_tavily').value.trim(),
-          jina_api_key: $('cfg_jina').value.trim(),
-          xhs_mcp_url: $('cfg_xhs_url').value.trim(),
-        },
-      });
+      const _imgModel = _readImageModelFromUI();
+      const _body = {
+        llm_api_key: $('cfg_llm_key').value.trim(),
+        openai_base_url: $('cfg_base_url').value.trim(),
+        default_model: $('cfg_model').value.trim(),
+        tavily_api_key: $('cfg_tavily').value.trim(),
+        jina_api_key: $('cfg_jina').value.trim(),
+        xhs_mcp_url: $('cfg_xhs_url').value.trim(),
+      };
+      if (_imgModel) _body.image_model = _imgModel;
+      await api('/api/config', { method: 'POST', body: _body });
       toast('配置已保存, MCP 服务已重启', 'success');
       refreshAccount(true);
     } catch (e) {
@@ -1205,10 +1311,102 @@
     }
   });
 
-  // 当切到 config tab 时, 在 loadConfig 外再额外加载 agent specs
+  // 当切到 config tab 时, 在 loadConfig 外再额外加载 agent specs + brand voice
   tabs.forEach((b) => {
     if (b.dataset.tab === 'config') {
-      b.addEventListener('click', () => loadAgentSpecs());
+      b.addEventListener('click', () => {
+        loadAgentSpecs();
+        loadBrandVoice();
+      });
+    }
+  });
+
+  // ===================================================================
+  // BRAND VOICE EDITOR (in CONFIG tab)
+  // ===================================================================
+  let __brandDefaults = null;
+
+  function _bvUpdateCounter() {
+    const ta = $('bv_voice_prompt');
+    const cnt = $('bv_prompt_counter');
+    if (!ta || !cnt) return;
+    const n = ta.value.length;
+    const max = 8000;
+    cnt.textContent = `${n} / ${max}`;
+    cnt.style.color = n > max ? '#d70015' : (n > max * 0.95 ? '#bf6900' : '#86868b');
+  }
+
+  function _bvSetState(text, kind) {
+    const el = $('brandVoiceState');
+    if (!el) return;
+    el.textContent = text;
+    el.classList.remove('warn');
+    if (kind === 'warn') el.classList.add('warn');
+  }
+
+  async function loadBrandVoice() {
+    const ta = $('bv_voice_prompt');
+    if (!ta) return;
+    _bvSetState('加载中', null);
+    try {
+      const d = await api('/api/brand-voice');
+      const bv = d.brand_voice || {};
+      __brandDefaults = d.defaults || null;
+      $('bv_brand_full').value = bv.brand_full || '';
+      $('bv_brand_short').value = bv.brand_short || '';
+      ta.value = bv.voice_prompt || '';
+      const pathEl = $('bv_path');
+      if (pathEl && d.path) pathEl.textContent = d.path;
+      _bvUpdateCounter();
+      const isDefault = __brandDefaults
+        && bv.brand_full === __brandDefaults.brand_full
+        && bv.brand_short === __brandDefaults.brand_short
+        && bv.voice_prompt === __brandDefaults.voice_prompt;
+      _bvSetState(isDefault ? '默认' : '已自定义', isDefault ? null : 'warn');
+    } catch (e) {
+      _bvSetState('加载失败', 'warn');
+      toast('品牌人设加载失败: ' + e.message, 'error', 6000);
+    }
+  }
+
+  const bvPromptEl = $('bv_voice_prompt');
+  if (bvPromptEl) bvPromptEl.addEventListener('input', _bvUpdateCounter);
+
+  const saveBrandVoiceBtn = $('saveBrandVoiceBtn');
+  if (saveBrandVoiceBtn) saveBrandVoiceBtn.addEventListener('click', async () => {
+    withSpinner(saveBrandVoiceBtn, true);
+    try {
+      const d = await api('/api/brand-voice', {
+        method: 'POST',
+        body: {
+          brand_full: $('bv_brand_full').value.trim(),
+          brand_short: $('bv_brand_short').value.trim(),
+          voice_prompt: $('bv_voice_prompt').value,
+        },
+      });
+      toast(d.message || '已保存', 'success', 4000);
+      loadBrandVoice();
+    } catch (e) {
+      toast('保存失败: ' + e.message, 'error', 6000);
+    } finally {
+      withSpinner(saveBrandVoiceBtn, false);
+    }
+  });
+
+  const resetBrandVoiceBtn = $('resetBrandVoiceBtn');
+  if (resetBrandVoiceBtn) resetBrandVoiceBtn.addEventListener('click', async () => {
+    if (!confirm('确认恢复默认品牌人设? 当前修改将被清空 (会同步重建 agents.yaml.brand_prefix).')) {
+      return;
+    }
+    withSpinner(resetBrandVoiceBtn, true);
+    try {
+      const d = await api('/api/brand-voice/reset', { method: 'POST' });
+      toast(d.message || '已恢复默认', 'success', 4000);
+      loadBrandVoice();
+    } catch (e) {
+      toast('恢复失败: ' + e.message, 'error', 6000);
+    } finally {
+      withSpinner(resetBrandVoiceBtn, false);
     }
   });
 

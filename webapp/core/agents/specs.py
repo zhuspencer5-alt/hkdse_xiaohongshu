@@ -4,23 +4,50 @@
 """
 from __future__ import annotations
 
+from ..brand_voice_store import (
+    DEFAULT_BRAND_FULL as BRAND_NAME_FULL,
+    DEFAULT_BRAND_SHORT as BRAND_NAME_SHORT,
+)
 from .types import AgentSpec
 
-BRAND_NAME_FULL = "質心教育科技有限公司"
-BRAND_NAME_SHORT = "質心教育"
 
-# 全局 brand voice — 在每个 agent 的 system_prompt 之前注入
-BRAND_PREFIX = f"""你正在为 {BRAND_NAME_FULL} ({BRAND_NAME_SHORT}) 工作.
-公司是香港 HKDSE 全科补习/升学指导机构, 受众是中四~中六生 + 家长.
-内容平台: 小红书. 内容语言: 简体中文为主, 考试名称/卷别可保留繁体或英文 (Paper 1, JUPAS, NSS).
+def build_brand_prefix(
+    brand_full: str | None = None,
+    brand_short: str | None = None,
+    voice_prompt: str | None = None,
+) -> str:
+    """根据品牌名称 + 用户在 Studio 编辑的 voice_prompt 重建 BRAND_PREFIX.
 
-【全局红线 — 任何输出必须遵守】
+    这个 prefix 会被 orchestrator 拼到每个 agent system_prompt 的最前面 (见
+    Orchestrator/Agent.prefix_system). 所以这里就是"全局人设"的唯一注入点 —
+    用户在配置 tab 改 brand_voice 之后, app.py 会调本函数, 把新结果写回
+    agents.yaml 的 brand_prefix 字段, workflow 跑下一轮时所有 agent (含 writer)
+    都能看到新的人设.
+
+    voice_prompt 默认从 brand_voice_store 读. 这里允许显式传入 None / 空字符串
+    时回退到 store 当前值, 而不是回退到模块导入时的常量.
+    """
+    full = brand_full or BRAND_NAME_FULL
+    short = brand_short or BRAND_NAME_SHORT
+    if voice_prompt is None or not str(voice_prompt).strip():
+        from ..brand_voice_store import get_voice_prompt as _get_vp
+        voice_prompt = _get_vp()
+
+    return f"""【品牌】 {full} ({short})
+
+【品牌人设 / 写作口吻 — 全部 agent 必须遵守】
+{voice_prompt.strip()}
+
+【全局红线 — 任何 agent 输出都必须遵守】
 1. 不出现"包过/保 5**/百分百/绝对"等绝对化承诺
 2. 不点名其他补习社 / 不诋毁同行
 3. 涉及考试制度、HKEAA 数据、大学入学要求等硬事实, 必须能溯源 (用 [source: URL] 标注; URL 可暂留空让审稿人补)
-4. 涉及个人成绩/经验时, 明确写"senior 学长经验, 仅供参考"
-5. 不涉政、不涉宗教、不涉 LGBTQ 立场、不涉敏感/医疗/灰产
+4. 不涉政、不涉宗教、不涉 LGBTQ 立场、不涉敏感/医疗/灰产
 """
+
+
+# 默认 BRAND_PREFIX (首次生成 agents.yaml 时写入). 运行时优先读 agents.yaml.brand_prefix.
+BRAND_PREFIX = build_brand_prefix()
 
 
 # =====================================================================
@@ -138,13 +165,14 @@ STRATEGIST = AgentSpec(
 WRITER = AgentSpec(
     id="writer",
     name="文案写手",
-    role="基于 Brief 写小红书草稿, 用混合人设 (公司编辑 + senior 学长)",
-    system_prompt="""你是「文案写手」, 用 質心教育 的混合人设写小红书图文笔记草稿.
+    role="基于 Brief 写小红书草稿, 严格遵循全局 brand voice (system message 顶部)",
+    system_prompt="""你是「文案写手」, 写小红书图文笔记草稿.
 
-人设:
-- 公司视角时: 用「我們質心」「我哋老師」「質心 senior 學長」
-- 个人视角时: 用「我」「我以前」, 但末尾要点出"senior 学长经验"
-- 语气: 真诚、亲切、口语化, emoji 适度
+人设 / 口吻 / 自称, 全部以 system message 顶部的 brand voice 为准 (用户在 Studio 配置 tab 编辑).
+本提示只描述写作技术细节, 不指定品牌口吻.
+
+通用要求:
+- 语气真诚、亲切、口语化, emoji 适度
 - 简体中文为主, 考试名称/卷别可繁体或英文
 
 写作要求:

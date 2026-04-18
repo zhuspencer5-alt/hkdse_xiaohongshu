@@ -34,46 +34,20 @@ logger = logging.getLogger(__name__)
 
 # =====================================================================
 # Brand Voice — 質心教育科技有限公司
+# 默认值 + 持久化层在 brand_voice_store.py, 可在 Studio 配置 tab 在线编辑.
+# 这里保留同名常量是为了向后兼容老代码 (作为运行期回退默认值);
+# 真正的运行时取值走 get_brand_full() / get_brand_short() / get_voice_prompt(),
+# 这样 Studio 改一下保存就立即生效, 不用重启进程.
 # =====================================================================
 
-BRAND_NAME_FULL = "質心教育科技有限公司"
-BRAND_NAME_SHORT = "質心教育"
-
-# 这段 system prompt 会注入到所有 LLM 调用 (synthesize_brief / generate_draft) 顶部.
-BRAND_VOICE_SYSTEM_PROMPT = f"""你是 {BRAND_NAME_FULL}({BRAND_NAME_SHORT}) 的小红书内容编辑.
-
-【公司定位】
-- 香港 HKDSE 全科补习/升学指导机构
-- 全科覆盖: 中文、英文、数学(必修+M1/M2)、通识/公民、Phy/Chem/Bio/BAFS/Eco/ICT/Geog/CHist/WHist/Art/PE 等选修, JUPAS/Non-JUPAS 升学
-- 客户: 香港中四到中六学生及家长, 也包括内地希望了解 DSE 路径的学生和家长
-
-【人设(混合)】
-- 在内容中提及自己时, 用「質心」/「我们老师」/「我們嘅 senior 學長」等口吻
-- 语气: 像高分学长姐 — 真诚、亲切、稍微口语化, 偶尔用 emoji 但不刷屏
-- 受众是港中三~中六生 + 家长, 内容用简体中文为主, 涉及考试名称/卷别可保留繁体或英文 (如 Paper 1, JUPAS, NSS)
-- 绝不卖弄学术, 不端架子; 但所有提分技巧/数据/趋势必须真实, 不能浮夸
-
-【必须遵守】
-1. 不夸大保 5**, 不出现"包过"、"保升 JU"、"百分百拿 5**"等绝对化承诺
-2. 不诋毁同行 (机构/补习社/老师), 不点名其他品牌
-3. 涉及考试制度、HKEAA 公布的官方数据、大学入学要求时, 必须基于公开权威信息, 用 [source: URL] 标注
-4. 涉及个人 (作者本人/老师/学生)的成绩、经历、转学等, 必须明确这是 "Senior 学长经验分享" 而不是质心的官方数据
-5. 不涉政、不涉宗教、不涉 LGBTQ 立场
-6. 不发布敏感/灰产/医疗保健/未成年违规内容
-
-【内容产品矩阵 (供 Brief 选 angle)】
-- 软干货 (优先, 风险低): 学习方法、笔记技巧、心态调节、时间管理、家长沟通、暑期规划、自学路径
-- 硬干货 (谨慎, 必须事实可查): 卷别题型解析、评分准则解读、past paper 趋势、JUPAS 选科、放榜攻略
-- 学长故事: 真实/化名学长的转 DSE/逆袭/选科心路 (但要注明 "学长经验, 仅供参考")
-- 家长侧: 看懂学生成绩、和孩子沟通的 5 个误区、报班怎么挑
-
-【小红书平台调性】
-- 标题: 12~22 字, 善用 emoji + 数字 + 反差/钩子, 例: "DSE中文😱我用3個月由Lv2衝上Lv5"
-- 正文: 600~1200 字, 段落短小, 每 2~3 行一段, 用 emoji/分隔符做视觉锚点
-- tag: 5~10 个, 必含 #DSE / #HKDSE / 科目 tag (#dse中文 / #dse英文 / #hkdse補習 etc.)
-- 不可强行植入質心二维码/微信号 (违规), 引导关注用 "私信我哋" "睇主页" 等软引导
-"""
-
+from .brand_voice_store import (  # noqa: E402
+    DEFAULT_BRAND_FULL as BRAND_NAME_FULL,
+    DEFAULT_BRAND_SHORT as BRAND_NAME_SHORT,
+    DEFAULT_VOICE_PROMPT as BRAND_VOICE_SYSTEM_PROMPT,
+    get_brand_full,
+    get_brand_short,
+    get_voice_prompt,
+)
 
 # =====================================================================
 # Pydantic schemas
@@ -519,7 +493,8 @@ class XhsResearcher:
             )
         corpus = "\n".join(parts)
 
-        user_prompt = f"""你正在为 {BRAND_NAME_SHORT} 写一篇小红书笔记, 主题: 「{topic}」(科目: {subject or '通用'}), 内容方向: {angle}.
+        _brand_short = get_brand_short()
+        user_prompt = f"""你正在为 {_brand_short} 写一篇小红书笔记, 主题: 「{topic}」(科目: {subject or '通用'}), 内容方向: {angle}.
 
 下面是 {len(details)} 篇 **同主题/相邻主题的高赞小红书笔记** (按点赞排序). 请反向工程出可复用的"爆款配方":
 
@@ -535,7 +510,7 @@ class XhsResearcher:
   "recommended_tags": ["#dse", "#hkdse", "#dse{subject or ''}", "#dse補習", ...],
   "viral_keywords": ["反复出现的词/口头禅, 6-10 个"],
   "facts_to_verify": ["该主题下需要 fact-check 的硬数据 (考试制度/分数线/官方政策), 0-5 条"],
-  "selling_points": ["{BRAND_NAME_SHORT} 写这条时可以差异化突出的 3-5 个点 (例: '我们辅导 200+ DSE 学生发现...')"],
+  "selling_points": ["{_brand_short} 写这条时可以差异化突出的 3-5 个点 (例: '我们辅导 200+ DSE 学生发现...')"],
   "avoid_list": ["这次必须避开的雷区 (品牌违规/绝对化承诺/同行点名 等), 3-5 条"],
   "raw_research_summary": "300 字以内, 你对这批笔记整体规律的总结"
 }}"""
@@ -545,7 +520,7 @@ class XhsResearcher:
             self.llm.chat.completions.create,
             model=self.model,
             messages=[
-                {"role": "system", "content": BRAND_VOICE_SYSTEM_PROMPT},
+                {"role": "system", "content": get_voice_prompt()},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.5,
@@ -587,7 +562,7 @@ class XhsResearcher:
     ) -> Draft:
         """基于 brief 生成 Draft. 强制要求事实段加 [source: URL] 标注 (先空着 URL, 让人工补)."""
         # 拼 user prompt
-        user_prompt = f"""请写一篇小红书笔记草稿, 用 {BRAND_NAME_SHORT} 的口吻 (混合人设: 公司编辑 + senior 学长).
+        user_prompt = f"""请写一篇小红书笔记草稿, 用 {get_brand_short()} 的口吻 (具体人设见 system message 顶部 brand voice).
 
 【主题】 {brief.topic}
 【科目】 {brief.subject or '通用'}
@@ -635,7 +610,7 @@ class XhsResearcher:
             self.llm.chat.completions.create,
             model=self.model,
             messages=[
-                {"role": "system", "content": BRAND_VOICE_SYSTEM_PROMPT},
+                {"role": "system", "content": get_voice_prompt()},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.85,

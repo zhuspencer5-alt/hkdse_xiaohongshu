@@ -367,6 +367,7 @@
             <option>生物</option>
             <option>经济/BAFS</option>
             <option>JUPAS</option>
+            <option>其他</option>
           </select>
         </label>
         <label class="field">
@@ -608,22 +609,57 @@
           <button id="testLoginBtn">🔓 测试登录</button>
         </div>
       </div>
+      <div class="row">
+        <label class="field grow">
+          <span>封面/配图模型 (image_model, OpenRouter)</span>
+          <select id="cfg_image_model_preset">
+            <option value="bytedance-seed/seedream-4.5">ByteDance Seedream 4.5 (中文文字渲染好)</option>
+            <option value="google/gemini-3.1-flash-image-preview">Nano Banana 2 / Gemini 3.1 Flash Image (Google, 速度快)</option>
+            <option value="__custom__">自定义…</option>
+          </select>
+        </label>
+        <label class="field grow" id="cfg_image_model_custom_wrap" style="display:none;">
+          <span>自定义模型 slug</span>
+          <input id="cfg_image_model_custom" placeholder="例: black-forest-labs/flux-1.1-pro" />
+        </label>
+      </div>
       <div class="toolbar" style="margin-top: 16px;">
         <button class="primary" id="saveConfigBtn">💾 保存配置</button>
       </div>
     </div>
 
     <div class="card">
-      <h2>品牌人设 (只读)</h2>
-      <p style="color:#424245; line-height:1.7;">
-        <strong>{{ brand_full or "質心教育科技有限公司" }}</strong> · HKDSE 全科补习与升学指导<br/>
-        全 LLM 调用都会注入「{{ brand_short or "質心教育" }}」混合人设 system prompt:
-        公司编辑 + senior 学长口吻, 简体中文为主, 考试名称保留繁体/英文,
-        禁用绝对化承诺/同行点名/敏感话题, 硬事实强制 [source: ] 标注.
+      <div class="toolbar">
+        <h2 style="margin:0; flex:1;">品牌人设 <span class="pill" id="brandVoiceState" style="font-size:11px;">…</span></h2>
+        <button id="resetBrandVoiceBtn" title="清空 webapp/config/brand_voice.json, 回到代码默认值">↩️ 恢复默认</button>
+        <button class="primary" id="saveBrandVoiceBtn">💾 保存</button>
+      </div>
+      <p style="color:#86868b; font-size:12px; margin:-4px 0 12px;">
+        所有 LLM 调用 (synthesize_brief / generate_draft / 6 个 agent) 都会注入这段
+        system prompt. 修改保存后立即生效, 不用重启进程.
+        <span class="pill warn" style="font-size:11px;">影响范围: 全平台</span>
       </p>
-      <p style="color:#86868b; font-size:12px;">
-        如需调整品牌人设, 编辑 <code>webapp/core/xhs_research.py</code> 顶部的
-        <code>BRAND_VOICE_SYSTEM_PROMPT</code> 常量.
+      <div class="row">
+        <label class="field grow">
+          <span>公司全称 (brand_full, ≤100 字)</span>
+          <input id="bv_brand_full" placeholder="質心教育科技有限公司" maxlength="100" />
+        </label>
+        <label class="field grow">
+          <span>品牌简称 (brand_short, ≤50 字)</span>
+          <input id="bv_brand_short" placeholder="質心教育" maxlength="50" />
+        </label>
+      </div>
+      <label class="field">
+        <span>
+          品牌人设 system prompt (voice_prompt, ≤8000 字)
+          <span id="bv_prompt_counter" style="float:right; color:#86868b; font-size:11px;">0 / 8000</span>
+        </span>
+        <textarea id="bv_voice_prompt" rows="18" style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; line-height:1.55;"
+                  placeholder="加载中…"></textarea>
+      </label>
+      <p style="color:#86868b; font-size:11px; margin-top:8px;">
+        持久化文件: <code id="bv_path">webapp/config/brand_voice.json</code>.
+        改完保存后, agents.yaml 的 <code>brand_prefix</code> 也会用新品牌名自动重建.
       </p>
     </div>
 

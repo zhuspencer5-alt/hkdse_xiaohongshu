@@ -45,6 +45,15 @@ from core.agents import (
     DEFAULT_SPECS_PATH,
 )
 from core.agents.workflows import list_workflows
+from core.brand_voice_store import (
+    BrandVoiceValidationError,
+    get_brand_full as _get_brand_full,
+    get_brand_short as _get_brand_short,
+    get_defaults as _brand_voice_defaults,
+    load_brand_voice as _load_brand_voice,
+    reset_brand_voice as _reset_brand_voice,
+    save_brand_voice as _save_brand_voice,
+)
 from config.config_manager import ConfigManager
 from cache.cache_manager import CacheManager
 
@@ -117,12 +126,15 @@ cache_manager = CacheManager()
 
 # Pydantic 模型
 class ConfigRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     llm_api_key: Optional[str] = None
     openai_base_url: Optional[str] = None
     default_model: Optional[str] = None
     jina_api_key: Optional[str] = None
     tavily_api_key: Optional[str] = None
     xhs_mcp_url: Optional[str] = None
+    image_model: Optional[str] = None  # 封面/配图生成用的 OpenRouter 模型 slug
 
 
 class TestLoginRequest(BaseModel):
@@ -191,6 +203,11 @@ class ResearchBriefRequest(BaseModel):
 class DraftGenerateRequest(BaseModel):
     brief: Dict[str, Any]
     extra_instructions: str = ""
+    # 可选 fallback: 当 brief 是 strategist 直接 dump 的 (没有 topic/subject/angle 字段)
+    # 时用这些值兜底, 避免 Brief Pydantic 校验失败. 前端"重新生成"按钮会带上.
+    topic: Optional[str] = None
+    subject: Optional[str] = None
+    angle: Optional[str] = None
 
 
 class DraftSaveRequest(BaseModel):
@@ -688,8 +705,8 @@ async def studio_page(request: Request):
         request,
         "studio.html",
         {
-            "brand_full": BRAND_NAME_FULL,
-            "brand_short": BRAND_NAME_SHORT,
+            "brand_full": _get_brand_full(),
+            "brand_short": _get_brand_short(),
         },
     )
 
@@ -774,9 +791,24 @@ async def api_research_brief(req: ResearchBriefRequest) -> Dict[str, Any]:
 
 @app.post("/api/draft/generate")
 async def api_draft_generate(req: DraftGenerateRequest) -> Dict[str, Any]:
-    """基于 Brief 生成 Draft, 自动入草稿队列 (status=draft)."""
+    """基于 Brief 生成 Draft, 自动入草稿队列 (status=draft).
+
+    历史 draft 的 brief 可能来自 strategist agent, 缺 topic/subject/angle.
+    这里做 best-effort 补全, 避免 500.
+    """
     researcher = _make_researcher()
-    brief = Brief(**req.brief)
+    brief_payload: Dict[str, Any] = dict(req.brief or {})
+    if not brief_payload.get("topic"):
+        brief_payload["topic"] = (req.topic or "").strip() or "未命名主题"
+    if not brief_payload.get("subject") and req.subject:
+        brief_payload["subject"] = req.subject
+    if not brief_payload.get("angle") and req.angle:
+        brief_payload["angle"] = req.angle
+    try:
+        brief = Brief(**brief_payload)
+    except Exception as exc:
+        logger.exception("api_draft_generate: Brief 校验失败 payload_keys=%s", list(brief_payload.keys()))
+        raise HTTPException(status_code=400, detail=f"brief 字段不合法: {exc}") from exc
     draft = await researcher.generate_draft(brief, extra_instructions=req.extra_instructions)
     # 入草稿队列
     draft_dict = draft.model_dump()
@@ -832,6 +864,136 @@ async def api_delete_draft(draft_id: str) -> Dict[str, Any]:
     if not ok:
         raise HTTPException(status_code=404, detail="草稿不存在")
     return {"success": True}
+
+
+class RegenerateImageRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    index: int = 0  # 0 = 封面 (3:4), >=1 = 配图 body_<n> (1:1)
+    prompt: Optional[str] = None
+    aspect_ratio: Optional[str] = None  # 不传则按 index 推断
+    model: Optional[str] = None  # 不传则用 config.image_model
+
+
+def _draft_default_image_prompt(draft: Dict[str, Any], index: int) -> str:
+    """根据草稿生成兜底 prompt: 封面用 cover_concept, 配图用 brief.angle + 标题."""
+    title = (draft.get("title") or "").strip()
+    topic = (draft.get("topic") or "").strip()
+    cover_concept = (draft.get("cover_concept") or "").strip()
+    subject = (draft.get("subject") or "").strip()
+    brief = draft.get("brief") or {}
+    angle = (brief.get("angle") if isinstance(brief, dict) else "") or ""
+
+    parts: List[str] = []
+    if index == 0:
+        parts.append("小红书封面图, 竖版 3:4, 大字标题清晰可读, 风格简洁醒目, 高对比配色.")
+        if cover_concept:
+            parts.append(f"封面构思: {cover_concept}")
+        if title:
+            parts.append(f"主标题文字: 「{title}」")
+        if topic or subject:
+            parts.append(f"主题: {topic or subject}")
+    else:
+        parts.append("小红书正文配图, 1:1, 信息可视化海报风格, 简洁干净.")
+        if topic or subject:
+            parts.append(f"围绕主题: {topic or subject} ({subject})")
+        if angle:
+            parts.append(f"内容方向: {angle}")
+        if title:
+            parts.append(f"作为辅助配图, 与主图标题 「{title}」 保持视觉一致.")
+    parts.append("不出现真实人物面孔, 中文文字必须正确无错字.")
+    return "\n".join(parts)
+
+
+@app.post("/api/draft/{draft_id}/image/regenerate")
+async def api_regenerate_draft_image(draft_id: str, req: RegenerateImageRequest) -> Dict[str, Any]:
+    """重新生成草稿里的某一张图. 调用方传 index (0=封面). 默认 prompt 取自 cover_concept.
+
+    生成后会:
+      1. 落盘到 cache/images/<draft_id>/<role>.png (覆盖原文件)
+      2. 更新 draft.image_urls[index] / draft.images[index] (不存在则 append), URL 末尾带 ?v=ts 避免浏览器缓存
+      3. 返回新 url + path
+    """
+    draft = cache_manager.get_task_by_id(draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="草稿不存在")
+
+    if req.index < 0 or req.index > 20:
+        raise HTTPException(status_code=400, detail="index 不合法 (0-20)")
+
+    role = "cover" if req.index == 0 else f"body_{req.index}"
+    aspect = req.aspect_ratio or ("3:4" if req.index == 0 else "1:1")
+
+    config = config_manager.load_config(for_display=False)
+    base_url = config.get("openai_base_url") or ""
+    image_key = (
+        config.get("openrouter_api_key")
+        or (config.get("llm_api_key") if "openrouter.ai" in base_url else None)
+    )
+    if not image_key:
+        raise HTTPException(
+            status_code=400,
+            detail="未配置 OpenRouter key (openrouter_api_key 或 llm_api_key + openrouter base_url)",
+        )
+    image_model = (req.model or config.get("image_model") or "bytedance-seed/seedream-4.5").strip()
+
+    prompt = (req.prompt or "").strip() or _draft_default_image_prompt(draft, req.index)
+
+    # 复用 cover_designer 用的同一套 image.generate 工具实现 (避免重复 OpenRouter 调用代码)
+    from core.agents.tools import make_image_tools
+    tool = make_image_tools(
+        openrouter_api_key=image_key,
+        base_url="https://openrouter.ai/api/v1",
+        model=image_model,
+    )[0]
+
+    try:
+        result = await tool.fn({
+            "prompt": prompt,
+            "draft_id": draft_id,
+            "role": role,
+            "aspect_ratio": aspect,
+            "model": image_model,
+        })
+    except Exception as e:
+        logger.error(f"重生成图片失败 draft={draft_id} index={req.index}: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"生成失败: {e}")
+
+    new_path: str = result.get("path") or ""
+    new_url: str = result.get("url") or ""
+    if not new_url:
+        raise HTTPException(status_code=502, detail="生成成功但未返回 url")
+
+    # 加 cache-bust 时间戳, 让浏览器立即看到新图 (StaticFiles 不会自动设 no-cache)
+    import time as _time
+    cache_bust = f"?v={int(_time.time())}"
+    url_with_bust = new_url + cache_bust
+
+    image_urls = list(draft.get("image_urls") or [])
+    images = list(draft.get("images") or [])
+    while len(image_urls) <= req.index:
+        image_urls.append("")
+    while len(images) <= req.index:
+        images.append("")
+    image_urls[req.index] = url_with_bust
+    images[req.index] = new_path
+
+    cache_manager.update_task(draft_id, {
+        "image_urls": image_urls,
+        "images": images,
+    })
+
+    return {
+        "success": True,
+        "index": req.index,
+        "role": role,
+        "url": url_with_bust,
+        "path": new_path,
+        "model": result.get("model") or image_model,
+        "bytes": result.get("bytes"),
+        "prompt_used": prompt,
+        "draft": cache_manager.get_task_by_id(draft_id),
+    }
 
 
 @app.post("/api/draft/{draft_id}/publish")
@@ -1248,6 +1410,7 @@ def _orch_cache_key(config: Dict[str, Any]) -> str:
         config.get("xhs_mcp_url") or "",
         config.get("openai_base_url") or "",
         (config.get("default_model") or "")[:64],
+        (config.get("image_model") or "")[:64],
         # api key 不入 key (避免泄露), 用 hash 末位区分
         str(hash(config.get("llm_api_key") or "") % 100000),
         str(DEFAULT_SPECS_PATH.stat().st_mtime if DEFAULT_SPECS_PATH.exists() else 0),
@@ -1453,6 +1616,115 @@ async def api_save_specs(req: SaveSpecsRequest) -> Dict[str, Any]:
 
     _ORCH_CACHE.clear()  # 全部重建
     return {"success": True, "n_specs": len(specs), "path": str(DEFAULT_SPECS_PATH)}
+
+
+# ====================================================================
+# 品牌人设 (brand voice) — 在线编辑
+# ====================================================================
+
+def _sync_agents_yaml_brand_prefix(
+    brand_full: str,
+    brand_short: str,
+    voice_prompt: Optional[str] = None,
+) -> bool:
+    """用新的 brand_full / brand_short / voice_prompt 重建 agents.yaml 的 brand_prefix.
+
+    brand_prefix 会被 orchestrator 拼到每个 agent 的 system_prompt 前面, 所以
+    用户在配置 tab 改了人设后, 必须把 voice_prompt 也带进来重建 prefix, 否则
+    workflow 路径的 writer/critic/reviser 看到的还是旧人设.
+
+    用户选了 "sync" 路径, 这里直接用 build_brand_prefix() 重建 (会覆盖用户对
+    BRAND_PREFIX 文本的自定义; 如需细粒度控制, 走 Agent 规格编辑器单独改).
+    返回 True 表示文件被更新.
+    """
+    from core.agents.specs import build_brand_prefix
+    import yaml as _yaml
+
+    try:
+        if DEFAULT_SPECS_PATH.exists():
+            with open(DEFAULT_SPECS_PATH, "r", encoding="utf-8") as f:
+                data = _yaml.safe_load(f) or {}
+        else:
+            data = {}
+    except Exception as e:
+        logger.warning(f"读取 agents.yaml 失败, 跳过 brand_prefix 同步: {e}")
+        return False
+
+    new_prefix = build_brand_prefix(brand_full, brand_short, voice_prompt)
+    if data.get("brand_prefix") == new_prefix:
+        return False
+
+    data["brand_prefix"] = new_prefix
+    DEFAULT_SPECS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(DEFAULT_SPECS_PATH, "w", encoding="utf-8") as f:
+            _yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False, width=120)
+    except Exception as e:
+        logger.warning(f"写回 agents.yaml 失败: {e}")
+        return False
+    logger.info("📝 agents.yaml.brand_prefix 已随 brand_voice 重建")
+    return True
+
+
+@app.get("/api/brand-voice")
+async def api_get_brand_voice() -> Dict[str, Any]:
+    """返回当前品牌人设 (brand_full / brand_short / voice_prompt) + 默认值, 供 Studio 编辑."""
+    from core.brand_voice_store import BRAND_VOICE_PATH as _bv_path
+    return {
+        "success": True,
+        "brand_voice": _load_brand_voice(),
+        "defaults": _brand_voice_defaults(),
+        "path": str(_bv_path),
+    }
+
+
+class BrandVoiceRequest(BaseModel):
+    brand_full: Optional[str] = None
+    brand_short: Optional[str] = None
+    voice_prompt: Optional[str] = None
+
+
+@app.post("/api/brand-voice")
+async def api_save_brand_voice(req: BrandVoiceRequest) -> Dict[str, Any]:
+    """保存品牌人设. 同步刷新 agents.yaml.brand_prefix (品牌名替换), 并清 orchestrator cache."""
+    payload = req.model_dump(exclude_unset=True)
+    try:
+        saved = _save_brand_voice(payload)
+    except BrandVoiceValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"保存品牌人设失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    yaml_synced = _sync_agents_yaml_brand_prefix(
+        saved["brand_full"], saved["brand_short"], saved.get("voice_prompt"),
+    )
+    _ORCH_CACHE.clear()  # voice_prompt + brand_prefix 立即生效
+    return {
+        "success": True,
+        "brand_voice": saved,
+        "agents_yaml_synced": yaml_synced,
+        "message": "品牌人设已保存并立即生效" + (" (agents.yaml 已同步)" if yaml_synced else ""),
+    }
+
+
+@app.post("/api/brand-voice/reset")
+async def api_reset_brand_voice() -> Dict[str, Any]:
+    """删除 brand_voice.json, 回退到代码默认值; 同步重建 agents.yaml.brand_prefix."""
+    try:
+        defaults = _reset_brand_voice()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    yaml_synced = _sync_agents_yaml_brand_prefix(
+        defaults["brand_full"], defaults["brand_short"], defaults.get("voice_prompt"),
+    )
+    _ORCH_CACHE.clear()
+    return {
+        "success": True,
+        "brand_voice": defaults,
+        "agents_yaml_synced": yaml_synced,
+        "message": "已恢复默认品牌人设",
+    }
 
 
 @app.post("/api/workflow/run")
